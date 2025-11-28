@@ -1,0 +1,14 @@
+*.db
+.venv
+.env
+dist
+build
+/dist
+/build
+dist/
+build/
+/dist/
+/build/
+*.exe
+*.spec
+*.pkg
