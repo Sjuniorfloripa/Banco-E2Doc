@@ -7,7 +7,7 @@ import smtplib
 from email.message import EmailMessage
 from pathlib import Path
 import sys
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import flet as ft
 import pandas as pd
@@ -32,7 +32,9 @@ INPUT_FOLDER = os.getenv("EQS_INPUT_FOLDER", "").strip()
 if not INPUT_FOLDER:
     INPUT_FOLDER = str(BASE_DIR / "storage")
 
+WORKERS = int(os.getenv("EQS_WORKERS", "4"))
 
+# SMTP / Email
 SMTP_SERVER = os.getenv("EQS_SMTP_SERVER", "smtp.office365.com")
 SMTP_PORT = int(os.getenv("EQS_SMTP_PORT", "587"))
 SMTP_USER = os.getenv("EQS_SMTP_USER", "")
@@ -324,18 +326,23 @@ def process_excel_file(file_path: str, logger=None) -> dict:
     return {"ok": True, "table_name": table_name, "message": msg}
 
 
-def process_all_files_in_folder(folder_path: str, logger=None) -> list[dict]:
-    def log(msg: str):
+def process_all_files_in_folder(
+    folder_path: str,
+    logger=None,
+    workers: int = 4,
+) -> list[dict]:
+
+    def ui_log(msg: str):
         if logger:
             logger(msg)
 
     results: list[dict] = []
 
     if not folder_path or not os.path.isdir(folder_path):
-        log(f"Pasta de entrada inválida ou inexistente: {folder_path!r}")
+        ui_log(f"Pasta de entrada inválida ou inexistente: {folder_path!r}")
         return results
 
-    log(f"Varredura iniciada na pasta: {folder_path}")
+    ui_log(f"Varredura iniciada na pasta: {folder_path}")
 
     excel_files = [
         os.path.join(folder_path, f)
@@ -344,31 +351,64 @@ def process_all_files_in_folder(folder_path: str, logger=None) -> list[dict]:
     ]
 
     if not excel_files:
-        log("Nenhum arquivo Excel (*.xlsx / *.xls) encontrado na pasta.")
+        ui_log("Nenhum arquivo Excel (*.xlsx / *.xls) encontrado na pasta.")
         return results
 
-    log(f"{len(excel_files)} arquivo(s) Excel encontrado(s).")
+    ui_log(f"{len(excel_files)} arquivo(s) Excel encontrado(s).")
+    ui_log(f"Processamento paralelo com até {workers} worker(s)...")
 
-    for file_path in excel_files:
-        file_name = os.path.basename(file_path)
-        log(f"--- Iniciando processamento do arquivo: {file_name} ---")
+    def worker_task(file_path: str):
+        local_logs: list[str] = []
 
-        result = process_excel_file(file_path, logger=log)
+        def thread_log(message: str):
+            local_logs.append(message)
 
-        results.append(
-            {
-                "file_path": file_path,
-                "file_name": file_name,
-                "ok": result["ok"],
-                "table_name": result["table_name"],
-                "message": result["message"],
-            }
-        )
+        result = process_excel_file(file_path, logger=thread_log)
+        return file_path, result, local_logs
 
-        status = "SUCESSO" if result["ok"] else "ERRO"
-        log(f"--- Finalizado {status} para o arquivo: {file_name} ---")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(worker_task, file_path): file_path
+            for file_path in excel_files
+        }
 
-    log("Varredura da pasta concluída.")
+        for future in as_completed(future_map):
+            file_path = future_map[future]
+            file_name = os.path.basename(file_path)
+
+            try:
+                file_path_result, result, local_logs = future.result()
+
+                for msg in local_logs:
+                    ui_log(f"[{file_name}] {msg}")
+
+                status = "SUCESSO" if result["ok"] else "ERRO"
+                ui_log(f"--- Finalizado {status} para o arquivo: {file_name} ---")
+
+                results.append(
+                    {
+                        "file_path": file_path_result,
+                        "file_name": file_name,
+                        "ok": result["ok"],
+                        "table_name": result["table_name"],
+                        "message": result["message"],
+                    }
+                )
+
+            except Exception as e:
+                msg = f"Erro inesperado no processamento de {file_name}: {e}"
+                ui_log(msg)
+                results.append(
+                    {
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "ok": False,
+                        "table_name": None,
+                        "message": msg,
+                    }
+                )
+
+    ui_log("Varredura da pasta concluída (execução paralela finalizada).")
     return results
 
 
@@ -385,6 +425,11 @@ def main(page: ft.Page):
     status_text = ft.Text("Clique no botão para processar a pasta configurada no .env.")
     folder_text = ft.Text(
         f"Pasta configurada (EQS_INPUT_FOLDER): {INPUT_FOLDER or '[NÃO DEFINIDA]'}",
+        size=12,
+        color=ft.Colors.GREY,
+    )
+    workers_text = ft.Text(
+        f"Workers paralelos (EQS_WORKERS): {WORKERS}",
         size=12,
         color=ft.Colors.GREY,
     )
@@ -418,7 +463,11 @@ def main(page: ft.Page):
         status_text.value = "Iniciando processamento da pasta..."
         page.update()
 
-        results = process_all_files_in_folder(INPUT_FOLDER, logger=ui_log)
+        results = process_all_files_in_folder(
+            INPUT_FOLDER,
+            logger=ui_log,
+            workers=WORKERS,
+        )
 
         if not results:
             status_text.value = "Nenhum arquivo foi processado."
@@ -450,6 +499,7 @@ def main(page: ft.Page):
                 run_button,
                 status_text,
                 folder_text,
+                workers_text,
                 ft.Text("Log do processo:", size=14, weight=ft.FontWeight.BOLD),
                 ft.Container(
                     content=log_view,

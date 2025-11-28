@@ -12,3 +12,4 @@ build/
 *.exe
 *.spec
 *.pkg
+*.xlsx
