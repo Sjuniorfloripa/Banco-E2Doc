@@ -8,10 +8,12 @@ from email.message import EmailMessage
 from pathlib import Path
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 
 import flet as ft
 import pandas as pd
 from sqlalchemy import create_engine, text
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # -------------------------------------------------------------------
@@ -24,10 +26,36 @@ else:
 
 load_dotenv(BASE_DIR / ".env")
 
-DB_PATH = BASE_DIR / "EQS_automate_database.db"
-DB_URL = f"sqlite:///{DB_PATH}"
+
+def build_db_url(base_dir: Path) -> str:
+    db_url_env = os.getenv("EQS_DB_URL")
+    if db_url_env:
+        return db_url_env
+
+    backend = os.getenv("EQS_DB_BACKEND", "sqlite").lower()
+
+    if backend == "postgres":
+        host = os.getenv("EQS_DB_HOST", "localhost")
+        port = os.getenv("EQS_DB_PORT", "5432")
+        name = os.getenv("EQS_DB_NAME", "eqs_automate")
+        user = os.getenv("EQS_DB_USER", "postgres")
+        password = os.getenv("EQS_DB_PASSWORD", "")
+
+        user_enc = quote_plus(user)
+        password_enc = quote_plus(password)
+
+        return f"postgresql+psycopg2://{user_enc}:{password_enc}@{host}:{port}/{name}"
+
+    db_path = base_dir / "EQS_automate_database.db"
+    return f"sqlite:///{db_path}"
+
+
+DB_URL = build_db_url(BASE_DIR)
 engine = create_engine(DB_URL, echo=False, future=True)
 
+IS_POSTGRES = DB_URL.startswith("postgresql")
+
+# Pasta de entrada
 INPUT_FOLDER = os.getenv("EQS_INPUT_FOLDER", "").strip()
 if not INPUT_FOLDER:
     INPUT_FOLDER = str(BASE_DIR / "storage")
@@ -47,6 +75,7 @@ REPORT_EMAIL = os.getenv(
 # -------------------------------------------------------------------
 # EMAIL – RELATÓRIO EM HTML
 # -------------------------------------------------------------------
+
 
 def send_email_report(
     results: list[dict],
@@ -137,6 +166,7 @@ def send_email_report(
 # FUNÇÕES DE SUPORTE (NORMALIZAÇÃO / BD)
 # -------------------------------------------------------------------
 
+
 def normalize_string(value: str) -> str:
     if not value:
         return ""
@@ -173,10 +203,11 @@ def table_name_from_path(path: str) -> str:
 
 
 def infer_sql_type(dtype) -> str:
+
     if pd.api.types.is_integer_dtype(dtype):
-        return "INTEGER"
+        return "BIGINT" if IS_POSTGRES else "INTEGER"
     if pd.api.types.is_float_dtype(dtype):
-        return "REAL"
+        return "DOUBLE PRECISION" if IS_POSTGRES else "REAL"
     if pd.api.types.is_datetime64_any_dtype(dtype):
         return "TIMESTAMP"
     if pd.api.types.is_bool_dtype(dtype):
@@ -226,9 +257,15 @@ def ensure_table(table_name: str, df: pd.DataFrame, logger=None):
     columns_def.append('_row_hash TEXT UNIQUE')
 
     columns_sql = ", ".join(columns_def)
+
+    if IS_POSTGRES:
+        id_column = "id BIGSERIAL PRIMARY KEY"
+    else:
+        id_column = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS "{table_name}" (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        {id_column},
         {columns_sql}
     );
     """
@@ -331,7 +368,6 @@ def process_all_files_in_folder(
     logger=None,
     workers: int = 4,
 ) -> list[dict]:
-
     def ui_log(msg: str):
         if logger:
             logger(msg)
@@ -372,41 +408,41 @@ def process_all_files_in_folder(
             for file_path in excel_files
         }
 
-        for future in as_completed(future_map):
-            file_path = future_map[future]
-            file_name = os.path.basename(file_path)
+    for future in as_completed(future_map):
+        file_path = future_map[future]
+        file_name = os.path.basename(file_path)
 
-            try:
-                file_path_result, result, local_logs = future.result()
+        try:
+            file_path_result, result, local_logs = future.result()
 
-                for msg in local_logs:
-                    ui_log(f"[{file_name}] {msg}")
+            for msg in local_logs:
+                ui_log(f"[{file_name}] {msg}")
 
-                status = "SUCESSO" if result["ok"] else "ERRO"
-                ui_log(f"--- Finalizado {status} para o arquivo: {file_name} ---")
+            status = "SUCESSO" if result["ok"] else "ERRO"
+            ui_log(f"--- Finalizado {status} para o arquivo: {file_name} ---")
 
-                results.append(
-                    {
-                        "file_path": file_path_result,
-                        "file_name": file_name,
-                        "ok": result["ok"],
-                        "table_name": result["table_name"],
-                        "message": result["message"],
-                    }
-                )
+            results.append(
+                {
+                    "file_path": file_path_result,
+                    "file_name": file_name,
+                    "ok": result["ok"],
+                    "table_name": result["table_name"],
+                    "message": result["message"],
+                }
+            )
 
-            except Exception as e:
-                msg = f"Erro inesperado no processamento de {file_name}: {e}"
-                ui_log(msg)
-                results.append(
-                    {
-                        "file_path": file_path,
-                        "file_name": file_name,
-                        "ok": False,
-                        "table_name": None,
-                        "message": msg,
-                    }
-                )
+        except Exception as e:
+            msg = f"Erro inesperado no processamento de {file_name}: {e}"
+            ui_log(msg)
+            results.append(
+                {
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    "ok": False,
+                    "table_name": None,
+                    "message": msg,
+                }
+            )
 
     ui_log("Varredura da pasta concluída (execução paralela finalizada).")
     return results
@@ -416,15 +452,18 @@ def process_all_files_in_folder(
 # INTERFACE FLET
 # -------------------------------------------------------------------
 
+
 def main(page: ft.Page):
     page.title = "EQS Automate Conversor - Excel → Banco"
     page.window.height = 800
     page.window.width = 700
     page.window.resizable = False
 
+    current_input_folder = INPUT_FOLDER
+
     status_text = ft.Text("Clique no botão para processar a pasta configurada no .env.")
     folder_text = ft.Text(
-        f"Pasta configurada (EQS_INPUT_FOLDER): {INPUT_FOLDER or '[NÃO DEFINIDA]'}",
+        f"Pasta configurada (EQS_INPUT_FOLDER): {current_input_folder or '[NÃO DEFINIDA]'}",
         size=12,
         color=ft.Colors.GREY,
     )
@@ -449,12 +488,74 @@ def main(page: ft.Page):
         log_view.controls.append(ft.Text(line, size=12))
         page.update()
 
+    def update_env_input_folder(new_folder: str):
+        env_path = BASE_DIR / ".env"
+        lines = []
+        if env_path.exists():
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith("EQS_INPUT_FOLDER="):
+                new_lines.append(f"EQS_INPUT_FOLDER={new_folder}")
+                found = True
+            else:
+                new_lines.append(line)
+
+        if not found:
+            new_lines.append(f"EQS_INPUT_FOLDER={new_folder}")
+
+        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        ui_log(f"EQS_INPUT_FOLDER atualizado no .env para: {new_folder}")
+
+    def on_folder_result(e: ft.FilePickerResultEvent):
+        nonlocal current_input_folder
+        if e.path:
+            current_input_folder = e.path
+            folder_text.value = (
+                f"Pasta configurada (EQS_INPUT_FOLDER): {current_input_folder}"
+            )
+            update_env_input_folder(current_input_folder)
+            page.update()
+        else:
+            ui_log("Nenhuma pasta selecionada.")
+
+    folder_picker = ft.FilePicker(on_result=on_folder_result)
+    page.overlay.append(folder_picker)
+
+    def choose_folder(e):
+        folder_picker.get_directory_path()
+
+    def start_auto_close():
+        countdown_text = ft.Text("Fechando em 3...")
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Processamento concluído"),
+            content=countdown_text,
+        )
+
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
+
+        async def do_countdown():
+            for i in range(3, 0, -1):
+                countdown_text.value = f"Fechando em {i}..."
+                page.update()
+                await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
+            page.window.close()
+
+        page.run_task(do_countdown)
+
     def on_run_click(e):
         log_view.controls.clear()
         log_buffer.clear()
         page.update()
 
-        if not INPUT_FOLDER:
+        if not current_input_folder:
             status_text.value = "EQS_INPUT_FOLDER não está definido no .env."
             ui_log(status_text.value)
             page.update()
@@ -464,7 +565,7 @@ def main(page: ft.Page):
         page.update()
 
         results = process_all_files_in_folder(
-            INPUT_FOLDER,
+            current_input_folder,
             logger=ui_log,
             workers=WORKERS,
         )
@@ -476,16 +577,25 @@ def main(page: ft.Page):
 
         ok_count = sum(1 for r in results if r["ok"])
         err_count = len(results) - ok_count
-        status_text.value = f"Processamento concluído. Sucesso: {ok_count}, Erros: {err_count}."
+        status_text.value = (
+            f"Processamento concluído. Sucesso: {ok_count}, Erros: {err_count}."
+        )
         page.update()
 
         ui_log("Gerando e-mail de relatório...")
         send_email_report(results, log_buffer, logger=ui_log)
         page.update()
 
+        start_auto_close()
+
     run_button = ft.ElevatedButton(
         "Processar pasta de arquivos Excel",
         on_click=on_run_click,
+    )
+
+    choose_folder_button = ft.ElevatedButton(
+        "Selecionar pasta de arquivos Excel",
+        on_click=choose_folder,
     )
 
     page.add(
@@ -496,7 +606,10 @@ def main(page: ft.Page):
                     size=20,
                     weight=ft.FontWeight.BOLD,
                 ),
-                run_button,
+                ft.Row(
+                    [run_button, choose_folder_button],
+                    spacing=10,
+                ),
                 status_text,
                 folder_text,
                 workers_text,
