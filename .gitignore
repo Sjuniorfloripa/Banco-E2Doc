@@ -9,6 +9,9 @@ dist/
 build/
 /dist/
 /build/
+Output
+/Output
+/Output/
 *.exe
 *.spec
 *.pkg
